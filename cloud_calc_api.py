@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import operator
 import math
+import fnmatch
 
 app = Flask(__name__)
 CORS(app)  # Necessario per chiamate da Google Sheets
@@ -30,6 +31,7 @@ OPERATIONS = {
     
     # Operazioni condizionali
     'if': lambda condition, true_val, false_val: true_val if condition else false_val,
+    'iferror': lambda value, fallback=0: fallback if (isinstance(value, str) and str(value).startswith('#')) else value,
     
     # Funzioni matematiche
     'sqrt': lambda a: math.sqrt(a),
@@ -51,6 +53,76 @@ OPERATIONS = {
     'trim': lambda s: str(s).strip(),
     'len': lambda s: len(str(s)),
 }
+
+def match_criteria(value, criteria):
+    """Confronta un valore con un criterio stile SUMIFS/COUNTIFS"""
+    if criteria is None:
+        return value is None
+
+    criteria_str = str(criteria).strip()
+
+    # Operatori di confronto
+    if criteria_str.startswith('>='):
+        try:
+            return float(value) >= float(criteria_str[2:])
+        except (ValueError, TypeError):
+            return False
+    elif criteria_str.startswith('<='):
+        try:
+            return float(value) <= float(criteria_str[2:])
+        except (ValueError, TypeError):
+            return False
+    elif criteria_str.startswith('<>'):
+        return str(value).lower() != criteria_str[2:].lower()
+    elif criteria_str.startswith('>'):
+        try:
+            return float(value) > float(criteria_str[1:])
+        except (ValueError, TypeError):
+            return False
+    elif criteria_str.startswith('<'):
+        try:
+            return float(value) < float(criteria_str[1:])
+        except (ValueError, TypeError):
+            return False
+
+    # Wildcard matching (*, ?)
+    if '*' in criteria_str or '?' in criteria_str:
+        return fnmatch.fnmatch(str(value).lower(), criteria_str.lower())
+
+    # Match esatto (case-insensitive per stringhe)
+    if isinstance(value, str) and isinstance(criteria, str):
+        return value.strip().lower() == criteria.strip().lower()
+
+    # Confronto numerico
+    try:
+        return float(value) == float(criteria)
+    except (ValueError, TypeError):
+        return str(value).strip().lower() == criteria_str.lower()
+
+
+def calc_sumifs(sum_range, criteria_pairs):
+    """Implementazione di SUMIFS: somma condizionale con criteri multipli"""
+    total = 0
+    for i in range(len(sum_range)):
+        match = True
+        for pair in criteria_pairs:
+            crit_range = pair['range']
+            criteria = pair['criteria']
+            if i >= len(crit_range):
+                match = False
+                break
+            if not match_criteria(crit_range[i], criteria):
+                match = False
+                break
+        if match:
+            val = sum_range[i]
+            if val is not None:
+                try:
+                    total += float(val)
+                except (ValueError, TypeError):
+                    pass
+    return total
+
 
 def parse_value(value):
     """Converte il valore nel tipo appropriato"""
@@ -96,15 +168,39 @@ def calculate():
         if not operation:
             return jsonify({'error': 'Operation is required'}), 400
         
+        # SUMIFS: gestione speciale con payload strutturato
+        if operation == 'sumifs':
+            sum_range_raw = data.get('sum_range', [])
+            criteria_pairs_raw = data.get('criteria_pairs', [])
+
+            if not sum_range_raw or not criteria_pairs_raw:
+                return jsonify({
+                    'error': 'sumifs richiede sum_range e criteria_pairs nel payload'
+                }), 400
+
+            sum_range = [parse_value(v) for v in sum_range_raw]
+            criteria_pairs = []
+            for pair in criteria_pairs_raw:
+                criteria_pairs.append({
+                    'range': [parse_value(v) for v in pair['range']],
+                    'criteria': parse_value(pair['criteria'])
+                })
+
+            result = calc_sumifs(sum_range, criteria_pairs)
+            return jsonify({
+                'result': result,
+                'operation': operation
+            })
+
         if operation not in OPERATIONS:
             return jsonify({
                 'error': f'Unknown operation: {operation}',
                 'available': list(OPERATIONS.keys())
             }), 400
-        
+
         # Parse degli argomenti
         args = [parse_value(arg) for arg in args_raw]
-        
+
         # Esegui l'operazione
         result = OPERATIONS[operation](*args)
         
@@ -128,8 +224,9 @@ def calculate():
 @app.route('/operations', methods=['GET'])
 def list_operations():
     """Elenca tutte le operazioni disponibili"""
+    ops = list(OPERATIONS.keys()) + ['sumifs']
     return jsonify({
-        'operations': list(OPERATIONS.keys())
+        'operations': sorted(ops)
     })
 
 @app.route('/health', methods=['GET'])
