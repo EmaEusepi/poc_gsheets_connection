@@ -293,20 +293,35 @@ def eval_sheet():
         xl_model = formulas_lib.ExcelModel().loads(tmp_path).finish()
         solution = xl_model.calculate()
 
+        # Costruisci un lookup normalizzato dalle chiavi della solution.
+        # La libreria formulas usa chiavi tipo "'[book.xlsx]Sheet'!A1"
+        # ma il formato esatto dipende dalla versione. Normalizziamo
+        # estraendo solo "SHEET!CELL" in uppercase per il matching.
+        import re
+        cell_pattern = re.compile(r"!([A-Z]+\d+)$", re.IGNORECASE)
+        sheet_pattern = re.compile(r"\](.+?)'!", re.IGNORECASE)
+
+        # Mappa: "SHEETNAME!CELLREF" -> valore
+        solution_map = {}
+        for key, val in solution.items():
+            cell_match = cell_pattern.search(str(key))
+            sheet_match = sheet_pattern.search(str(key))
+            if cell_match:
+                cell_name = cell_match.group(1).upper()
+                sheet_name = sheet_match.group(1).upper() if sheet_match else 'MODEL'
+                normalized_key = f"{sheet_name}!{cell_name}"
+                solution_map[normalized_key] = val
+
         # Leggi risultati dalla soluzione
         results = []
         for r in range(num_rows):
             row = []
             for c in range(num_cols):
-                # formulas usa chiavi tipo "'[book]Model'!A1"
-                # Ricava il nome colonna Excel (A, B, ..., Z, AA, AB, ...)
                 col_letter = openpyxl.utils.get_column_letter(c + 1)
-                cell_ref = "'[{}]Model'!{}{}".format(
-                    os.path.basename(tmp_path), col_letter, r + 1
-                )
+                lookup_key = f"MODEL!{col_letter}{r + 1}"
 
-                if cell_ref in solution:
-                    val = solution[cell_ref]
+                if lookup_key in solution_map:
+                    val = solution_map[lookup_key]
                     # Converti tipi numpy in tipi Python nativi
                     if isinstance(val, np.ndarray):
                         val = val.item() if val.size == 1 else val.tolist()
@@ -316,6 +331,8 @@ def eval_sheet():
                         val = float(val)
                     elif isinstance(val, (np.bool_,)):
                         val = bool(val)
+                    elif isinstance(val, np.str_):
+                        val = str(val)
                     row.append(val)
                 else:
                     # Cella senza formula: usa il valore originale
@@ -325,14 +342,28 @@ def eval_sheet():
 
         elapsed_ms = int((time.time() - start) * 1000)
 
-        return jsonify({
+        # Debug: include le chiavi raw della solution se richiesto
+        debug_info = {}
+        if data.get('debug'):
+            raw_keys = list(str(k) for k in solution.keys())
+            normalized_keys = list(solution_map.keys())
+            debug_info = {
+                'raw_solution_keys': raw_keys[:50],
+                'normalized_keys': normalized_keys[:50],
+            }
+
+        response_data = {
             'results': results,
             'stats': {
                 'total_cells': num_rows * num_cols,
                 'formula_cells': formula_count,
                 'eval_time_ms': elapsed_ms
             }
-        })
+        }
+        if debug_info:
+            response_data['debug'] = debug_info
+
+        return jsonify(response_data)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
