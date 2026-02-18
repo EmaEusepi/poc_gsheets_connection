@@ -14,7 +14,8 @@
 // 1. "Scongela formule" (o selezione) -> le formule-testo tornano formule vere
 // 2. Modifica, trascina, copia le formule normalmente
 // 3. "Congela formule" (o selezione) -> le formule diventano testo, Sheets smette di calcolare
-// 4. "Calcola tutto" -> invia le formule congelate al cloud, risultati in "Results"
+// 4. "Calcola tutto" -> invia le formule congelate al cloud
+//    I risultati vanno in un foglio "<nome_foglio>_RES" con lo stesso stile del sorgente
 
 // ⚠️ CONFIGURA IL TUO ENDPOINT QUI
 var BATCH_API_URL = 'http://18.153.39.218:5000';
@@ -200,25 +201,28 @@ function unfreezeRange_(range) {
 // ============================================
 
 /**
- * Legge il foglio "Model", separa formule (testo che inizia con "=")
- * dai valori, invia tutto al server, e scrive i risultati in "Results".
- *
- * Le formule devono essere "congelate" (testo) nel foglio Model.
+ * Legge il foglio attivo, separa formule (testo che inizia con "=")
+ * dai valori, invia tutto al server, e scrive i risultati in un foglio
+ * chiamato "<nome_foglio_attivo>_RES" (copiando anche lo stile).
  */
 function evaluateSheet() {
   var ui = SpreadsheetApp.getUi();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // 1. Leggi il foglio Model
-  var model = ss.getSheetByName('Model');
-  if (!model) {
-    ui.alert('Errore', 'Foglio "Model" non trovato. Crea un foglio chiamato "Model" con le tue formule.', ui.ButtonSet.OK);
+  // 1. Usa il foglio attivo come sorgente
+  var sourceSheet = ss.getActiveSheet();
+  var sourceName = sourceSheet.getName();
+  var resName = sourceName + '_RES';
+
+  // Impedisci di eseguire su un foglio _RES (evita loop)
+  if (sourceName.indexOf('_RES') === sourceName.length - 4) {
+    ui.alert('Errore', 'Non puoi eseguire "Calcola tutto" su un foglio risultati (_RES). Seleziona il foglio sorgente.', ui.ButtonSet.OK);
     return;
   }
 
-  var dataRange = model.getDataRange();
+  var dataRange = sourceSheet.getDataRange();
   if (dataRange.getNumRows() === 0 || dataRange.getNumColumns() === 0) {
-    ui.alert('Errore', 'Il foglio "Model" e\' vuoto.', ui.ButtonSet.OK);
+    ui.alert('Errore', 'Il foglio "' + sourceName + '" e\' vuoto.', ui.ButtonSet.OK);
     return;
   }
 
@@ -228,9 +232,6 @@ function evaluateSheet() {
   var realFormulas = dataRange.getFormulas();
 
   // 2. Separa formule dai valori
-  //    - Formule congelate: stringhe che iniziano con "=" in getValues()
-  //    - Formule vere (non congelate): da getFormulas()
-  //    - Valori: tutto il resto
   var formulas = [];
   var values = [];
 
@@ -242,15 +243,12 @@ function evaluateSheet() {
       var realFormula = realFormulas[r][c];
 
       if (realFormula) {
-        // Formula vera (non congelata) -> usala
         formulaRow.push(realFormula);
         valueRow.push(null);
       } else if (typeof val === 'string' && val.charAt(0) === '=') {
-        // Formula congelata (testo che inizia con "=")
         formulaRow.push(val);
         valueRow.push(null);
       } else {
-        // Valore diretto
         formulaRow.push('');
         if (val instanceof Date) {
           valueRow.push(val.toISOString());
@@ -306,13 +304,18 @@ function evaluateSheet() {
       return;
     }
 
-    // 5. Scrivi risultati nel foglio "Results"
-    var resultsSheet = ss.getSheetByName('Results');
-    if (!resultsSheet) {
-      resultsSheet = ss.insertSheet('Results');
+    // 5. Crea/ricrea il foglio risultati copiando lo stile dal sorgente
+    var resultsSheet = ss.getSheetByName(resName);
+    if (resultsSheet) {
+      // Elimina il vecchio foglio _RES per ricrearlo con lo stile aggiornato
+      ss.deleteSheet(resultsSheet);
     }
-    resultsSheet.clear();
 
+    // Copia il foglio sorgente (include formattazione, colori, larghezze, ecc.)
+    resultsSheet = sourceSheet.copyTo(ss);
+    resultsSheet.setName(resName);
+
+    // 6. Sovrascrivi con i risultati calcolati dal cloud
     // Assicurati che la griglia sia rettangolare
     var maxCols = 0;
     for (var r = 0; r < results.length; r++) {
@@ -324,12 +327,13 @@ function evaluateSheet() {
       }
     }
 
+    // Scrivi i valori (sovrascrive formule e testo, mantiene la formattazione)
     resultsSheet.getRange(1, 1, results.length, maxCols).setValues(results);
 
-    // 6. Report
+    // 7. Report
     var elapsed = new Date().getTime() - startTime;
     var stats = data.stats || {};
-    var msg = 'Calcolo completato in ' + (elapsed / 1000).toFixed(1) + 's';
+    var msg = 'Risultati scritti in "' + resName + '" (' + (elapsed / 1000).toFixed(1) + 's)';
     if (stats.formula_cells !== undefined) {
       msg += '\nFormule calcolate: ' + stats.formula_cells;
     }
