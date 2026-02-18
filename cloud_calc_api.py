@@ -6,9 +6,16 @@ import fnmatch
 import tempfile
 import os
 import time
-import openpyxl
-import formulas
-import numpy as np
+
+# Dipendenze opzionali per /eval_sheet
+# pip install formulas openpyxl numpy
+try:
+    import openpyxl
+    import formulas as formulas_lib
+    import numpy as np
+    EVAL_SHEET_AVAILABLE = True
+except ImportError:
+    EVAL_SHEET_AVAILABLE = False
 
 app = Flask(__name__)
 CORS(app)  # Necessario per chiamate da Google Sheets
@@ -230,6 +237,11 @@ def calculate():
 @app.route('/eval_sheet', methods=['POST'])
 def eval_sheet():
     """Valuta un intero foglio: riceve formule + valori, restituisce risultati."""
+    if not EVAL_SHEET_AVAILABLE:
+        return jsonify({
+            'error': 'Dipendenze mancanti. Installa con: pip install formulas openpyxl numpy'
+        }), 501
+
     tmp_path = None
     try:
         start = time.time()
@@ -278,7 +290,7 @@ def eval_sheet():
         wb.save(tmp_path)
 
         # Calcola con la libreria formulas
-        xl_model = formulas.ExcelModel().loads(tmp_path).finish()
+        xl_model = formulas_lib.ExcelModel().loads(tmp_path).finish()
         solution = xl_model.calculate()
 
         # Leggi risultati dalla soluzione
