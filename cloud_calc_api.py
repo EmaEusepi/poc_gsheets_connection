@@ -234,6 +234,131 @@ def calculate():
             'operation': operation
         }), 500
 
+# Mappa nomi funzione italiani -> inglesi (Google Sheets / Excel italiano)
+IT_TO_EN_FUNCTIONS = {
+    # Logiche / Condizionali
+    'SE': 'IF',
+    'SE.ERRORE': 'IFERROR',
+    'SE.NON.DISP': 'IFNA',
+    'E': 'AND',
+    'O': 'OR',
+    'NON': 'NOT',
+    'SWITCH': 'SWITCH',
+    'SCEGLI': 'CHOOSE',
+    # Matematiche
+    'SOMMA': 'SUM',
+    'PRODOTTO': 'PRODUCT',
+    'QUOZIENTE': 'QUOTIENT',
+    'RESTO': 'MOD',
+    'POTENZA': 'POWER',
+    'RADQ': 'SQRT',
+    'ASS': 'ABS',
+    'ARROTONDA': 'ROUND',
+    'ARROTONDA.PER.DIF': 'ROUNDDOWN',
+    'ARROTONDA.PER.ECC': 'ROUNDUP',
+    'INT': 'INT',
+    'CASUALE': 'RAND',
+    'CASUALE.TRA': 'RANDBETWEEN',
+    'LOG': 'LOG',
+    'LOG10': 'LOG10',
+    'LN': 'LN',
+    'EXP': 'EXP',
+    'PI.GRECO': 'PI',
+    # Aggregate
+    'MAX': 'MAX',
+    'MIN': 'MIN',
+    'MEDIA': 'AVERAGE',
+    'MEDIA.SE': 'AVERAGEIF',
+    'MEDIA.PIU.SE': 'AVERAGEIFS',
+    'CONTA.NUMERI': 'COUNT',
+    'CONTA.VALORI': 'COUNTA',
+    'CONTA.VUOTE': 'COUNTBLANK',
+    'CONTA.SE': 'COUNTIF',
+    'CONTA.PIU.SE': 'COUNTIFS',
+    'SOMMA.SE': 'SUMIF',
+    'SOMMA.PIU.SE': 'SUMIFS',
+    'GRANDE': 'LARGE',
+    'PICCOLO': 'SMALL',
+    # Ricerca
+    'CERCA.VERT': 'VLOOKUP',
+    'CERCA.ORIZZ': 'HLOOKUP',
+    'INDICE': 'INDEX',
+    'CONFRONTA': 'MATCH',
+    'RIF.INDIRETTO': 'INDIRECT',
+    'SCARTO': 'OFFSET',
+    # Testo
+    'CONCATENA': 'CONCATENATE',
+    'CONCAT': 'CONCAT',
+    'UNISCI.STRINGA': 'TEXTJOIN',
+    'SINISTRA': 'LEFT',
+    'DESTRA': 'RIGHT',
+    'STRINGA.ESTRAI': 'MID',
+    'LUNGHEZZA': 'LEN',
+    'MAIUSC': 'UPPER',
+    'MINUSC': 'LOWER',
+    'MAIUSC.INIZ': 'PROPER',
+    'ANNULLA.SPAZI': 'TRIM',
+    'SOSTITUISCI': 'SUBSTITUTE',
+    'RIMPIAZZA': 'REPLACE',
+    'TROVA': 'FIND',
+    'RICERCA': 'SEARCH',
+    'TESTO': 'TEXT',
+    'VALORE': 'VALUE',
+    # Data
+    'OGGI': 'TODAY',
+    'ADESSO': 'NOW',
+    'ANNO': 'YEAR',
+    'MESE': 'MONTH',
+    'GIORNO': 'DAY',
+    'ORA': 'HOUR',
+    'MINUTO': 'MINUTE',
+    'SECONDO': 'SECOND',
+    'DATA': 'DATE',
+}
+
+import re as _re
+
+def translate_formula_it_to_en(formula):
+    """Traduce una formula dalla sintassi italiana a quella inglese.
+    - Sostituisce nomi funzione IT -> EN
+    - Sostituisce ; con , come separatore argomenti (fuori dalle stringhe)
+    """
+    if not formula or not formula.startswith('='):
+        return formula
+
+    result = formula
+
+    # Sostituisci nomi funzione (ordine decrescente per lunghezza
+    # per evitare sostituzioni parziali, es: SOMMA.PIU.SE prima di SOMMA)
+    sorted_funcs = sorted(IT_TO_EN_FUNCTIONS.keys(), key=len, reverse=True)
+    for it_name in sorted_funcs:
+        en_name = IT_TO_EN_FUNCTIONS[it_name]
+        # Cerca il nome funzione seguito da ( - case insensitive
+        pattern = _re.compile(_re.escape(it_name) + r'\s*\(', _re.IGNORECASE)
+        result = pattern.sub(en_name + '(', result)
+
+    # Sostituisci ; con , ma solo fuori dalle stringhe
+    translated = []
+    in_string = False
+    string_char = None
+    for ch in result:
+        if in_string:
+            translated.append(ch)
+            if ch == string_char:
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+                string_char = '"'
+                translated.append(ch)
+            elif ch == ';':
+                translated.append(',')
+            else:
+                translated.append(ch)
+
+    return ''.join(translated)
+
+
 def convert_formulas_value_(val):
     """Converte i tipi della libreria formulas in tipi Python nativi serializzabili JSON."""
     if val is None:
@@ -311,8 +436,8 @@ def eval_sheet():
                     formula = formulas_grid[r][c]
 
                 if formula:
-                    # openpyxl accetta formule senza '=' iniziale
-                    cell.value = formula
+                    # Traduci da italiano a inglese se necessario
+                    cell.value = translate_formula_it_to_en(formula)
                     formula_count += 1
                 else:
                     # Valore diretto
