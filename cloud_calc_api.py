@@ -234,6 +234,41 @@ def calculate():
             'operation': operation
         }), 500
 
+def convert_formulas_value_(val):
+    """Converte i tipi della libreria formulas in tipi Python nativi serializzabili JSON."""
+    if val is None:
+        return ''
+
+    # Ranges object della libreria formulas -> prendi il primo valore
+    if hasattr(val, 'value'):
+        val = val.value
+
+    # numpy array
+    if EVAL_SHEET_AVAILABLE and isinstance(val, np.ndarray):
+        val = val.item() if val.size == 1 else val.tolist()
+
+    # Tipi numpy scalari
+    if EVAL_SHEET_AVAILABLE:
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            f = float(val)
+            return int(f) if f == int(f) else f
+        if isinstance(val, (np.bool_,)):
+            return bool(val)
+        if isinstance(val, (np.str_,)):
+            return str(val)
+
+    # Booleani Python nativi (prima di int, perche' bool e' subclass di int)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float, str)):
+        return val
+
+    # Fallback: converti a stringa
+    return str(val)
+
+
 @app.route('/eval_sheet', methods=['POST'])
 def eval_sheet():
     """Valuta un intero foglio: riceve formule + valori, restituisce risultati."""
@@ -322,17 +357,7 @@ def eval_sheet():
 
                 if lookup_key in solution_map:
                     val = solution_map[lookup_key]
-                    # Converti tipi numpy in tipi Python nativi
-                    if isinstance(val, np.ndarray):
-                        val = val.item() if val.size == 1 else val.tolist()
-                    if isinstance(val, (np.integer,)):
-                        val = int(val)
-                    elif isinstance(val, (np.floating,)):
-                        val = float(val)
-                    elif isinstance(val, (np.bool_,)):
-                        val = bool(val)
-                    elif isinstance(val, np.str_):
-                        val = str(val)
+                    val = convert_formulas_value_(val)
                     row.append(val)
                 else:
                     # Cella senza formula: usa il valore originale
