@@ -44,7 +44,25 @@ function CLOUD_CALC(operation) {
       args.push(arg === "" ? null : arg);
     }
   }
-  
+
+  // IFERROR: gestione locale (non può passare dall'API perché
+  // Sheets valuta gli argomenti PRIMA di passarli alla UDF,
+  // quindi un errore nell'arg1 arriverebbe come stringa "#DIV/0!" ecc.)
+  if (typeof operation === 'string' && operation.toLowerCase() === 'iferror') {
+    var value = args.length > 0 ? args[0] : null;
+    var fallback = args.length > 1 ? args[1] : "";
+    if (containsSheetError_(value)) {
+      return fallback;
+    }
+    return (value === null || value === undefined) ? "" : value;
+  }
+
+  // Validazione argomenti prima della chiamata API
+  var validationError = validateArgs_(operation, args);
+  if (validationError) {
+    return validationError;
+  }
+
   // Prepara il payload
   var payload = {
     'operation': operation,
@@ -111,6 +129,56 @@ function flattenRange_(range) {
 }
 
 /**
+ * Controlla se un valore e' un errore di Google Sheets.
+ * Quando una cella dipendente non e' ancora stata calcolata o e' in errore,
+ * Sheets passa stringhe come "#REF!", "#VALUE!", ecc.
+ */
+function containsSheetError_(value) {
+  if (typeof value !== 'string') return false;
+  var errorPrefixes = ['#REF!', '#VALUE!', '#N/A', '#NULL!', '#NUM!', '#DIV/0!', '#ERROR', '#NAME?'];
+  for (var i = 0; i < errorPrefixes.length; i++) {
+    if (value.indexOf(errorPrefixes[i]) === 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Valida gli argomenti prima della chiamata API.
+ * Restituisce null se tutto OK, altrimenti una stringa di errore.
+ */
+function validateArgs_(operation, args) {
+  // Validazione operazione
+  if (operation === null || operation === undefined || operation === '') {
+    return '#ERROR: Operazione mancante. Specificare il nome dell\'operazione come primo argomento.';
+  }
+  if (typeof operation !== 'string') {
+    return '#ERROR: L\'operazione deve essere una stringa (es: "plus", "multiply").';
+  }
+
+  // Controlla errori di Sheets negli argomenti
+  for (var i = 0; i < args.length; i++) {
+    if (containsSheetError_(args[i])) {
+      return '#ERROR: L\'argomento ' + (i + 1) + ' contiene un errore di Sheets (' + args[i] + '). Verificare le celle di input.';
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Controlla se un array (range appiattito) contiene errori di Sheets.
+ * Restituisce la prima stringa di errore trovata, o null se tutto OK.
+ */
+function findSheetErrorInRange_(flatRange) {
+  for (var i = 0; i < flatRange.length; i++) {
+    if (containsSheetError_(flatRange[i])) {
+      return flatRange[i];
+    }
+  }
+  return null;
+}
+
+/**
  * Esegue la chiamata API e restituisce il risultato
  */
 function callApi_(payload) {
@@ -160,13 +228,52 @@ function callApi_(payload) {
  * @customfunction
  */
 function CLOUD_SUMIFS(sum_range, criteria_range1, criteria1) {
+  // Validazione: sum_range obbligatorio
+  if (sum_range === undefined || sum_range === null) {
+    return '#ERROR: sum_range mancante. Specificare il range dei valori da sommare.';
+  }
+
+  // Validazione: almeno una coppia criteria_range/criteria
+  if (arguments.length < 3) {
+    return '#ERROR: Servono almeno sum_range, criteria_range e criteria. Forniti solo ' + arguments.length + ' argomenti.';
+  }
+
+  // Validazione: argomenti a coppie (criteria_range + criteria)
+  if ((arguments.length - 1) % 2 !== 0) {
+    return '#ERROR: Gli argomenti dopo sum_range devono essere a coppie (criteria_range, criteria). Numero di argomenti non valido.';
+  }
+
   var flatSumRange = flattenRange_(sum_range);
+
+  // Validazione: errori di Sheets nel sum_range
+  var sumRangeError = findSheetErrorInRange_(flatSumRange);
+  if (sumRangeError) {
+    return '#ERROR: sum_range contiene un errore di Sheets (' + sumRangeError + '). Verificare le celle di input.';
+  }
+
   var criteriaPairs = [];
 
   // Argomenti a coppie: criteria_range, criteria (a partire dall'indice 1)
   for (var i = 1; i < arguments.length; i += 2) {
     var criteriaRange = flattenRange_(arguments[i]);
     var criteria = arguments[i + 1];
+
+    // Validazione: errori di Sheets nel criteria_range
+    var criteriaRangeError = findSheetErrorInRange_(criteriaRange);
+    if (criteriaRangeError) {
+      return '#ERROR: criteria_range ' + Math.ceil(i / 2) + ' contiene un errore di Sheets (' + criteriaRangeError + '). Verificare le celle di input.';
+    }
+
+    // Validazione: criteria_range deve avere la stessa lunghezza di sum_range
+    if (criteriaRange.length !== flatSumRange.length) {
+      return '#ERROR: criteria_range ' + Math.ceil(i / 2) + ' ha ' + criteriaRange.length + ' elementi, ma sum_range ne ha ' + flatSumRange.length + '. I range devono avere la stessa lunghezza.';
+    }
+
+    // Validazione: errori di Sheets nel criterio
+    if (containsSheetError_(criteria)) {
+      return '#ERROR: Il criterio ' + Math.ceil(i / 2) + ' contiene un errore di Sheets (' + criteria + ').';
+    }
+
     criteriaPairs.push({
       'range': criteriaRange,
       'criteria': criteria === "" ? null : criteria

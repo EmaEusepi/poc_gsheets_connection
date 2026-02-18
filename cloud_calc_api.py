@@ -3,6 +3,12 @@ from flask_cors import CORS
 import operator
 import math
 import fnmatch
+import tempfile
+import os
+import time
+import openpyxl
+import formulas
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)  # Necessario per chiamate da Google Sheets
@@ -220,6 +226,113 @@ def calculate():
             'error': str(e),
             'operation': operation
         }), 500
+
+@app.route('/eval_sheet', methods=['POST'])
+def eval_sheet():
+    """Valuta un intero foglio: riceve formule + valori, restituisce risultati."""
+    tmp_path = None
+    try:
+        start = time.time()
+        data = request.get_json()
+
+        formulas_grid = data.get('formulas', [])
+        values_grid = data.get('values', [])
+
+        if not values_grid:
+            return jsonify({'error': 'values grid is required'}), 400
+
+        num_rows = len(values_grid)
+        num_cols = max(len(row) for row in values_grid) if values_grid else 0
+
+        if num_rows == 0 or num_cols == 0:
+            return jsonify({'error': 'Empty sheet'}), 400
+
+        # Crea workbook temporaneo con openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Model'
+
+        formula_count = 0
+
+        for r in range(num_rows):
+            for c in range(num_cols):
+                cell = ws.cell(row=r + 1, column=c + 1)
+
+                # Controlla se c'e' una formula
+                formula = ''
+                if r < len(formulas_grid) and c < len(formulas_grid[r]):
+                    formula = formulas_grid[r][c]
+
+                if formula:
+                    # openpyxl accetta formule senza '=' iniziale
+                    cell.value = formula
+                    formula_count += 1
+                else:
+                    # Valore diretto
+                    val = values_grid[r][c] if c < len(values_grid[r]) else None
+                    cell.value = parse_value(val)
+
+        # Salva su file temporaneo
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
+        os.close(tmp_fd)
+        wb.save(tmp_path)
+
+        # Calcola con la libreria formulas
+        xl_model = formulas.ExcelModel().loads(tmp_path).finish()
+        solution = xl_model.calculate()
+
+        # Leggi risultati dalla soluzione
+        results = []
+        for r in range(num_rows):
+            row = []
+            for c in range(num_cols):
+                # formulas usa chiavi tipo "'[book]Model'!A1"
+                # Ricava il nome colonna Excel (A, B, ..., Z, AA, AB, ...)
+                col_letter = openpyxl.utils.get_column_letter(c + 1)
+                cell_ref = "'[{}]Model'!{}{}".format(
+                    os.path.basename(tmp_path), col_letter, r + 1
+                )
+
+                if cell_ref in solution:
+                    val = solution[cell_ref]
+                    # Converti tipi numpy in tipi Python nativi
+                    if isinstance(val, np.ndarray):
+                        val = val.item() if val.size == 1 else val.tolist()
+                    if isinstance(val, (np.integer,)):
+                        val = int(val)
+                    elif isinstance(val, (np.floating,)):
+                        val = float(val)
+                    elif isinstance(val, (np.bool_,)):
+                        val = bool(val)
+                    row.append(val)
+                else:
+                    # Cella senza formula: usa il valore originale
+                    val = values_grid[r][c] if c < len(values_grid[r]) else None
+                    row.append(parse_value(val) if val is not None else '')
+            results.append(row)
+
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        return jsonify({
+            'results': results,
+            'stats': {
+                'total_cells': num_rows * num_cols,
+                'formula_cells': formula_count,
+                'eval_time_ms': elapsed_ms
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        # Pulizia file temporaneo
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
 
 @app.route('/operations', methods=['GET'])
 def list_operations():
