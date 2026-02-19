@@ -20,6 +20,16 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)  # Necessario per chiamate da Google Sheets
 
+@app.before_request
+def _start_timer():
+    request._start_time = time.time()
+
+@app.after_request
+def _log_request_time(response):
+    elapsed = time.time() - getattr(request, '_start_time', time.time())
+    print(f"[{request.method} {request.path}] {response.status_code} - {elapsed*1000:.0f}ms")
+    return response
+
 # Dizionario delle operazioni supportate
 OPERATIONS = {
     # Operazioni matematiche base

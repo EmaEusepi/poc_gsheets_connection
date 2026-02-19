@@ -10,7 +10,8 @@
 // 5. Salva e autorizza lo script
 
 // ⚠️ CONFIGURA IL TUO ENDPOINT QUI
-const API_BASE_URL = 'http://18.153.39.218:5000/calc';
+// const API_BASE_URL = 'http://18.153.39.218:5000/calc';
+const API_BASE_URL = 'http://35.159.123.184:5000/calc';
 
 /**
  * Esegue calcoli su cloud tramite API

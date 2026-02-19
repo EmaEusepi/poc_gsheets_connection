@@ -28,7 +28,8 @@ Attribute VB_Name = "CloudCalc"
 Option Explicit
 
 ' CONFIGURA IL TUO ENDPOINT QUI
-Private Const API_BASE_URL As String = "http://18.153.39.218:5000/calc"
+' Private Const API_BASE_URL As String = "http://18.153.39.218:5000/calc"
+Private Const API_BASE_URL As String = "http://35.159.123.184:5000/calc"
 
 ' ============================================
 ' FUNZIONI PUBBLICHE (usabili nel foglio)

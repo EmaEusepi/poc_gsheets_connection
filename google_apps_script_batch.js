@@ -18,7 +18,9 @@
 //    I risultati vanno in un foglio "<nome_foglio>_RES" con lo stesso stile del sorgente
 
 // ⚠️ CONFIGURA IL TUO ENDPOINT QUI
-var BATCH_API_URL = 'http://18.153.39.218:5000';
+// var BATCH_API_URL = 'http://18.153.39.218:5000';
+var BATCH_API_URL = 'http://35.159.123.184:5000';
+
 
 // ⚠️ PREREQUISITO: Abilita il servizio avanzato "Google Sheets API"
 // 1. In Apps Script, vai su Servizi (icona +) nel pannello a sinistra
