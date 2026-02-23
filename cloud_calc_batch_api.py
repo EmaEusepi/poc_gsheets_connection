@@ -17,6 +17,8 @@ Flusso:
 Avvio:  python cloud_calc_batch_api.py
 """
 
+from __future__ import annotations
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
