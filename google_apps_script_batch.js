@@ -416,7 +416,7 @@ function CLOUD_CALC_BATCH(operation) {
   }
 
   // -- 5. Validazione ----------------------------------------------------
-  var validationError = validateBatchArgs_(operation, values);
+  var validationError = validateBatchArgs_(operation);
   if (validationError) {
     return validationError;
   }
@@ -589,17 +589,15 @@ function containsBatchSheetError_(value) {
 /**
  * Valida gli argomenti prima della chiamata API.
  */
-function validateBatchArgs_(operation, args) {
+function validateBatchArgs_(operation) {
   if (operation === null || operation === undefined || operation === '') {
     return '#ERROR: Operazione mancante.';
   }
   if (typeof operation !== 'string') {
     return '#ERROR: L\'operazione deve essere una stringa.';
   }
-  for (var i = 0; i < args.length; i++) {
-    if (containsBatchSheetError_(args[i])) {
-      return '#ERROR: Argomento ' + (i + 1) + ' contiene errore Sheets (' + args[i] + ').';
-    }
-  }
+  // NON bloccare su errori Sheets negli argomenti:
+  // il server batch sostituira' i valori stale/errore con i risultati
+  // appena calcolati dalle celle dipendenti.
   return null;
 }
