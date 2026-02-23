@@ -320,4 +320,4 @@ if __name__ == '__main__':
     print("  POST /batch_calc  - calcolo con dipendenze (batch)")
     print("  GET  /health")
     print("  GET  /operations")
-    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

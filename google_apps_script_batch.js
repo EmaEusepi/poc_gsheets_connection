@@ -364,7 +364,7 @@ function evaluateSheet() {
 //
 
 // Endpoint batch (porta 5001, server separato)
-var BATCH_CALC_URL = 'http://35.159.123.184:5001/batch_calc';
+var BATCH_CALC_URL = 'http://35.159.123.184:5000/batch_calc';
 
 /**
  * Esegue un calcolo cloud con risoluzione batch delle dipendenze.
