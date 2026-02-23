@@ -348,3 +348,258 @@ function evaluateSheet() {
     ui.alert('Errore di connessione', 'Impossibile contattare il server:\n' + error.toString(), ui.ButtonSet.OK);
   }
 }
+
+
+// ============================================
+// CUSTOM FUNCTION BATCH - CLOUD_CALC_BATCH
+// ============================================
+//
+// NAMED FUNCTION (consigliata per semplicita' d'uso):
+//   Menu Dati > Named Functions > Aggiungi
+//   Nome:       CLOUD
+//   Argomenti:  operation, arg1, [arg2], [arg3], [arg4], [arg5], [arg6], [arg7], [arg8]
+//   Formula:    =CLOUD_CALC_BATCH(operation, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, ROW(), COLUMN())
+//
+//   L'utente scrive:  =CLOUD("sum"; A1; A2)
+//
+
+// Endpoint batch (porta 5001, server separato)
+var BATCH_CALC_URL = 'http://35.159.123.184:5001/batch_calc';
+
+/**
+ * Esegue un calcolo cloud con risoluzione batch delle dipendenze.
+ *
+ * Gli ultimi 2 argomenti DEVONO essere ROW() e COLUMN() (iniettati
+ * dalla Named Function oppure scritti a mano).
+ *
+ * @param {string} operation - Nome dell'operazione (es: "plus", "sum")
+ * @param {...any} args - Argomenti per l'operazione, seguiti da ROW() e COLUMN()
+ * @return {any} Risultato del calcolo
+ * @customfunction
+ */
+function CLOUD_CALC_BATCH(operation) {
+  // -- 1. Separa gli argomenti reali da ROW/COLUMN -----------------------
+  var allArgs = [];
+  for (var i = 1; i < arguments.length; i++) {
+    allArgs.push(arguments[i]);
+  }
+
+  // Gli ultimi 2 sono ROW() e COLUMN()
+  var colNum = allArgs.pop();
+  var rowNum = allArgs.pop();
+  var values = allArgs;
+
+  // Ricava il nome della cella chiamante (es: "C3")
+  var callingCell = columnToLetter_(colNum) + rowNum;
+
+  // -- 2. Leggi la formula dalla cella per estrarre i riferimenti --------
+  var refs = extractRefs_(rowNum, colNum);
+
+  // -- 3. Costruisci gli args come [{ref, value}] -----------------------
+  var payload_args = [];
+  for (var j = 0; j < values.length; j++) {
+    var entry = { value: values[j] === "" ? null : values[j] };
+    if (j < refs.length && refs[j] !== '') {
+      entry.ref = refs[j];
+    }
+    payload_args.push(entry);
+  }
+
+  // -- 4. IFERROR locale (come nella versione originale) -----------------
+  if (typeof operation === 'string' && operation.toLowerCase() === 'iferror') {
+    var val = payload_args.length > 0 ? payload_args[0].value : null;
+    var fallback = payload_args.length > 1 ? payload_args[1].value : "";
+    if (containsBatchSheetError_(val)) {
+      return fallback;
+    }
+    return (val === null || val === undefined) ? "" : val;
+  }
+
+  // -- 5. Validazione ----------------------------------------------------
+  var validationError = validateBatchArgs_(operation, values);
+  if (validationError) {
+    return validationError;
+  }
+
+  // -- 6. Chiamata al server batch ---------------------------------------
+  var payload = {
+    cell: callingCell,
+    operation: operation,
+    args: payload_args
+  };
+
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    var response = UrlFetchApp.fetch(BATCH_CALC_URL, options);
+    var responseCode = response.getResponseCode();
+    var responseBody = response.getContentText();
+    var contentType = response.getHeaders()['Content-Type'] || '';
+
+    if (contentType.indexOf('application/json') === -1) {
+      return '#ERROR: Risposta non JSON (HTTP ' + responseCode + ')';
+    }
+
+    if (responseCode === 200) {
+      var data = JSON.parse(responseBody);
+      var result = data.result;
+      if (result === null || result === undefined) return "";
+      return result;
+    } else {
+      var errorData = JSON.parse(responseBody);
+      return '#ERROR: ' + errorData.error;
+    }
+  } catch (error) {
+    return '#ERROR: ' + error.toString();
+  }
+}
+
+
+// =========================================================================
+// Helpers per CLOUD_CALC_BATCH
+// =========================================================================
+
+/**
+ * Legge la formula della cella (row, col) ed estrae i riferimenti celle
+ * passati come argomenti a CLOUD_CALC_BATCH (esclude operation, ROW, COLUMN).
+ *
+ * Esempio: =CLOUD_CALC_BATCH("sum"; A1; B2; ROW(); COLUMN())
+ *   -> ["A1", "B2"]
+ */
+function extractRefs_(row, col) {
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var formula = sheet.getRange(row, col).getFormula();
+    if (!formula) return [];
+
+    // Estrai il contenuto fra le parentesi piu' esterne della funzione
+    var depth = 0;
+    var start = -1;
+    var end = -1;
+    for (var i = 0; i < formula.length; i++) {
+      if (formula[i] === '(') {
+        if (depth === 0) start = i + 1;
+        depth++;
+      } else if (formula[i] === ')') {
+        depth--;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+    if (start === -1 || end === -1) return [];
+    var inner = formula.substring(start, end);
+
+    // Splitta rispettando parentesi e stringhe (gestisce sia ; che ,)
+    var rawArgs = splitFormulaArgs_(inner);
+
+    // Rimuovi primo arg (operation) e ultimi 2 (ROW(), COLUMN())
+    if (rawArgs.length < 3) return [];
+    var cellArgs = rawArgs.slice(1, rawArgs.length - 2);
+
+    // Filtra: tieni solo quelli che sembrano riferimenti cella
+    var cellRefPattern = /^\$?[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?$/i;
+    var refs = [];
+    for (var k = 0; k < cellArgs.length; k++) {
+      var arg = cellArgs[k].trim();
+      if (cellRefPattern.test(arg)) {
+        refs.push(arg.replace(/\$/g, '').toUpperCase());
+      } else {
+        // Valore letterale, nessun ref
+        refs.push('');
+      }
+    }
+    return refs;
+
+  } catch (e) {
+    // Se non riesce a leggere la formula, ritorna array vuoto
+    // (il server calcolera' senza info di dipendenza)
+    return [];
+  }
+}
+
+
+/**
+ * Splitta una stringa di argomenti rispettando parentesi, stringhe e
+ * il separatore ; (locale IT) o , (locale EN).
+ */
+function splitFormulaArgs_(inner) {
+  var args = [];
+  var depth = 0;
+  var inStr = false;
+  var current = '';
+
+  for (var i = 0; i < inner.length; i++) {
+    var ch = inner[i];
+    if (ch === '"') {
+      inStr = !inStr;
+      current += ch;
+    } else if (inStr) {
+      current += ch;
+    } else if (ch === '(') {
+      depth++;
+      current += ch;
+    } else if (ch === ')') {
+      depth--;
+      current += ch;
+    } else if ((ch === ',' || ch === ';') && depth === 0) {
+      args.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim() !== '') {
+    args.push(current.trim());
+  }
+  return args;
+}
+
+
+/**
+ * Converte un numero di colonna in lettera (1 -> A, 27 -> AA, ecc.)
+ */
+function columnToLetter_(col) {
+  var letter = '';
+  while (col > 0) {
+    var mod = (col - 1) % 26;
+    letter = String.fromCharCode(65 + mod) + letter;
+    col = Math.floor((col - 1) / 26);
+  }
+  return letter;
+}
+
+
+/**
+ * Controlla se un valore e' un errore di Google Sheets.
+ */
+function containsBatchSheetError_(value) {
+  if (typeof value !== 'string') return false;
+  var errorPrefixes = ['#REF!', '#VALUE!', '#N/A', '#NULL!', '#NUM!', '#DIV/0!', '#ERROR', '#NAME?'];
+  for (var i = 0; i < errorPrefixes.length; i++) {
+    if (value.indexOf(errorPrefixes[i]) === 0) return true;
+  }
+  return false;
+}
+
+
+/**
+ * Valida gli argomenti prima della chiamata API.
+ */
+function validateBatchArgs_(operation, args) {
+  if (operation === null || operation === undefined || operation === '') {
+    return '#ERROR: Operazione mancante.';
+  }
+  if (typeof operation !== 'string') {
+    return '#ERROR: L\'operazione deve essere una stringa.';
+  }
+  for (var i = 0; i < args.length; i++) {
+    if (containsBatchSheetError_(args[i])) {
+      return '#ERROR: Argomento ' + (i + 1) + ' contiene errore Sheets (' + args[i] + ').';
+    }
+  }
+  return null;
+}
