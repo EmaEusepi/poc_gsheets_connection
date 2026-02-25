@@ -31,6 +31,7 @@ import fnmatch
 # Configurazione
 # ---------------------------------------------------------------------------
 BATCH_WINDOW_S = 2.0   # secondi di silenzio prima di risolvere il batch
+CACHE_TTL_S = 30.0     # secondi di validita' della cache risultati
 
 app = Flask(__name__)
 CORS(app)
@@ -106,6 +107,8 @@ class BatchManager:
         self._lock = threading.Lock()
         self._batch: dict[str, dict] = {}      # cell -> entry
         self._timer: threading.Timer | None = None
+        # Cache: cell -> (timestamp, result_dict)
+        self._cache: dict[str, tuple[float, dict]] = {}
 
     # -- public API (chiamato dal thread Flask per ogni request) ------------
 
@@ -115,6 +118,17 @@ class BatchManager:
         Ritorna il dict {'result': ...} oppure {'error': ...}.
         """
         cell = normalize_cell(cell)
+
+        # Cache hit: se questa cella e' stata calcolata di recente,
+        # rispondi subito senza aspettare il batch.
+        # Questo evita le cascate di ricalcolo di Sheets.
+        with self._lock:
+            if cell in self._cache:
+                ts, cached_result = self._cache[cell]
+                if time.time() - ts < CACHE_TTL_S:
+                    print(f"[CACHE]  {cell} -> {cached_result.get('result', '?')} (age: {time.time()-ts:.1f}s)")
+                    return cached_result
+
         event = threading.Event()
         entry = {
             'cell': cell,
@@ -205,7 +219,11 @@ class BatchManager:
                 else:
                     result = OPERATIONS[op](*resolved_args)
                     computed[cell] = result
-                    entry['result'] = {'result': result, 'cell': cell}
+                    result_dict = {'result': result, 'cell': cell}
+                    entry['result'] = result_dict
+                    # Salva in cache
+                    with self._lock:
+                        self._cache[cell] = (time.time(), result_dict)
                     print(f"[BATCH]   {cell} = {result}")
             except Exception as e:
                 entry['result'] = {'error': f'Errore calcolo {cell}: {str(e)}'}

@@ -496,9 +496,20 @@ function extractRefs_(row, col) {
     // Splitta rispettando parentesi e stringhe (gestisce sia ; che ,)
     var rawArgs = splitFormulaArgs_(inner);
 
-    // Rimuovi primo arg (operation) e ultimi 2 (ROW(), COLUMN())
-    if (rawArgs.length < 3) return [];
-    var cellArgs = rawArgs.slice(1, rawArgs.length - 2);
+    // Rimuovi primo arg (operation).
+    // Se la formula e' una chiamata diretta a CLOUD_CALC_BATCH, gli ultimi
+    // 2 args sono ROW()/COLUMN() e vanno rimossi.
+    // Se e' una Named Function (es: CLOUD2), ROW/COLUMN non ci sono.
+    var rowColPattern = /^(ROW|COLUMN|RIF\.RIGA|RIF\.COLONNA)\(\)$/i;
+    var tailCount = 0;
+    if (rawArgs.length >= 2
+        && rowColPattern.test(rawArgs[rawArgs.length - 1].trim())
+        && rowColPattern.test(rawArgs[rawArgs.length - 2].trim())) {
+      tailCount = 2;
+    }
+
+    if (rawArgs.length < 1 + tailCount + 1) return [];
+    var cellArgs = rawArgs.slice(1, rawArgs.length - tailCount);
 
     // Filtra: tieni solo quelli che sembrano riferimenti cella
     var cellRefPattern = /^\$?[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?$/i;

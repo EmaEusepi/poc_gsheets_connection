@@ -364,7 +364,7 @@ End Function
 '''
 ' Appiattisce un Range Excel in un array monodimensionale.
 '
-Private Sub FlattenRange_(rng As Range, ByRef result() As Variant, ByRef count As Long)
+Private Sub FlattenRange_(ByVal rng As Variant, ByRef result() As Variant, ByRef count As Long)
     count = rng.Cells.count
     ReDim result(0 To count - 1)
 
