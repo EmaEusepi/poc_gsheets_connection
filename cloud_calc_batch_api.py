@@ -1,81 +1,128 @@
 """
-Cloud Calc Batch API
-====================
-Server che accumula le chiamate CLOUD_CALC provenienti da Google Sheets,
-ricostruisce il grafo di dipendenze fra celle e le risolve nell'ordine
-corretto (topological sort).
+Cloud Calc Batch API - Valutazione fogli interi
+================================================
+Server che riceve un intero foglio (formule congelate + valori)
+dal Google Apps Script (evaluateSheet), risolve le dipendenze
+e restituisce la griglia dei risultati calcolati.
 
-Flusso:
-1. Ogni cella con CLOUD_CALC invia: cell, operation, args [{ref, value}]
-2. Il server accumula le richieste in un batch (finestra di BATCH_WINDOW_S
-   secondi senza nuove richieste).
-3. Scaduta la finestra, costruisce il grafo di dipendenze, esegue
-   topological sort e calcola ogni cella nell'ordine giusto, propagando
-   i risultati alle celle dipendenti.
-4. Ogni request HTTP riceve la propria risposta.
+Dipendenze:
+    pip install flask flask-cors openpyxl formulas numpy
 
 Avvio:  python cloud_calc_batch_api.py
+
+Endpoint:
+    POST /eval_sheet  - valuta un intero foglio
+    GET  /health      - health check
+    GET  /operations  - lista operazioni disponibili
 """
 
 from __future__ import annotations
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import threading
+import tempfile
+import os
 import time
-import math
 import re
-import fnmatch
 
-# ---------------------------------------------------------------------------
-# Configurazione
-# ---------------------------------------------------------------------------
-BATCH_WINDOW_S = 2.0   # secondi di silenzio prima di risolvere il batch
-CACHE_TTL_S = 30.0     # secondi di validita' della cache risultati
+import openpyxl
+import formulas as formulas_lib
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
 
 # ---------------------------------------------------------------------------
-# Operazioni supportate (stesse di cloud_calc_api.py)
+# Mappa nomi funzione italiani -> inglesi (Google Sheets / Excel italiano)
 # ---------------------------------------------------------------------------
-OPERATIONS = {
-    'plus':       lambda *a: sum(a),
-    'minus':      lambda a, b: a - b,
-    'multiply':   lambda *a: math.prod(a),
-    'divide':     lambda a, b: a / b if b != 0 else '#DIV/0!',
-    'power':      lambda a, b: a ** b,
-    'mod':        lambda a, b: a % b,
-    'equals':     lambda a, b: a == b,
-    'greater':    lambda a, b: a > b,
-    'less':       lambda a, b: a < b,
-    'greater_equal': lambda a, b: a >= b,
-    'less_equal': lambda a, b: a <= b,
-    'and':        lambda *a: all(a),
-    'or':         lambda *a: any(a),
-    'not':        lambda a: not a,
-    'if':         lambda cond, t, f: t if cond else f,
-    'iferror':    lambda v, fb=0: fb if (isinstance(v, str) and v.startswith('#')) else v,
-    'sqrt':       lambda a: math.sqrt(a),
-    'abs':        lambda a: abs(a),
-    'round':      lambda a, d=0: round(a, int(d)),
-    'floor':      lambda a: math.floor(a),
-    'ceil':       lambda a: math.ceil(a),
-    'max':        lambda *a: max(a),
-    'min':        lambda *a: min(a),
-    'average':    lambda *a: sum(a) / len(a) if a else 0,
-    'count':      lambda *a: len(a),
-    'concat':     lambda *a: ''.join(str(x) for x in a),
-    'upper':      lambda s: str(s).upper(),
-    'lower':      lambda s: str(s).lower(),
-    'trim':       lambda s: str(s).strip(),
-    'len':        lambda s: len(str(s)),
+IT_TO_EN_FUNCTIONS = {
+    # Logiche / Condizionali
+    'SE': 'IF',
+    'SE.ERRORE': 'IFERROR',
+    'SE.NON.DISP': 'IFNA',
+    'E': 'AND',
+    'O': 'OR',
+    'NON': 'NOT',
+    'SWITCH': 'SWITCH',
+    'SCEGLI': 'CHOOSE',
+    # Matematiche
+    'SOMMA': 'SUM',
+    'PRODOTTO': 'PRODUCT',
+    'QUOZIENTE': 'QUOTIENT',
+    'RESTO': 'MOD',
+    'POTENZA': 'POWER',
+    'RADQ': 'SQRT',
+    'ASS': 'ABS',
+    'ARROTONDA': 'ROUND',
+    'ARROTONDA.PER.DIF': 'ROUNDDOWN',
+    'ARROTONDA.PER.ECC': 'ROUNDUP',
+    'INT': 'INT',
+    'CASUALE': 'RAND',
+    'CASUALE.TRA': 'RANDBETWEEN',
+    'LOG': 'LOG',
+    'LOG10': 'LOG10',
+    'LN': 'LN',
+    'EXP': 'EXP',
+    'PI.GRECO': 'PI',
+    # Aggregate
+    'MAX': 'MAX',
+    'MIN': 'MIN',
+    'MEDIA': 'AVERAGE',
+    'MEDIA.SE': 'AVERAGEIF',
+    'MEDIA.PIU.SE': 'AVERAGEIFS',
+    'CONTA.NUMERI': 'COUNT',
+    'CONTA.VALORI': 'COUNTA',
+    'CONTA.VUOTE': 'COUNTBLANK',
+    'CONTA.SE': 'COUNTIF',
+    'CONTA.PIU.SE': 'COUNTIFS',
+    'SOMMA.SE': 'SUMIF',
+    'SOMMA.PIU.SE': 'SUMIFS',
+    'GRANDE': 'LARGE',
+    'PICCOLO': 'SMALL',
+    # Ricerca
+    'CERCA.VERT': 'VLOOKUP',
+    'CERCA.ORIZZ': 'HLOOKUP',
+    'INDICE': 'INDEX',
+    'CONFRONTA': 'MATCH',
+    'RIF.INDIRETTO': 'INDIRECT',
+    'SCARTO': 'OFFSET',
+    # Testo
+    'CONCATENA': 'CONCATENATE',
+    'CONCAT': 'CONCAT',
+    'UNISCI.STRINGA': 'TEXTJOIN',
+    'SINISTRA': 'LEFT',
+    'DESTRA': 'RIGHT',
+    'STRINGA.ESTRAI': 'MID',
+    'LUNGHEZZA': 'LEN',
+    'MAIUSC': 'UPPER',
+    'MINUSC': 'LOWER',
+    'MAIUSC.INIZ': 'PROPER',
+    'ANNULLA.SPAZI': 'TRIM',
+    'SOSTITUISCI': 'SUBSTITUTE',
+    'RIMPIAZZA': 'REPLACE',
+    'TROVA': 'FIND',
+    'RICERCA': 'SEARCH',
+    'TESTO': 'TEXT',
+    'VALORE': 'VALUE',
+    # Data
+    'OGGI': 'TODAY',
+    'ADESSO': 'NOW',
+    'ANNO': 'YEAR',
+    'MESE': 'MONTH',
+    'GIORNO': 'DAY',
+    'ORA': 'HOUR',
+    'MINUTO': 'MINUTE',
+    'SECONDO': 'SECOND',
+    'DATA': 'DATE',
 }
 
+
 # ---------------------------------------------------------------------------
-# Parse helpers
+# Helpers
 # ---------------------------------------------------------------------------
+
 def parse_value(value):
+    """Converte il valore nel tipo appropriato."""
     if value is None or value == '':
         return None
     if isinstance(value, (int, float, bool)):
@@ -91,190 +138,80 @@ def parse_value(value):
         return s
 
 
-def normalize_cell(ref):
-    """Normalizza un riferimento cella in maiuscolo senza $: '$A$1' -> 'A1'."""
-    return ref.replace('$', '').upper().strip()
+def translate_formula_it_to_en(formula):
+    """Traduce una formula dalla sintassi italiana a quella inglese.
+    - Sostituisce nomi funzione IT -> EN
+    - Sostituisce ; con , come separatore argomenti (fuori dalle stringhe)
+    """
+    if not formula or not formula.startswith('='):
+        return formula
+
+    result = formula
+
+    # Sostituisci nomi funzione (ordine decrescente per lunghezza
+    # per evitare sostituzioni parziali, es: SOMMA.PIU.SE prima di SOMMA)
+    sorted_funcs = sorted(IT_TO_EN_FUNCTIONS.keys(), key=len, reverse=True)
+    for it_name in sorted_funcs:
+        en_name = IT_TO_EN_FUNCTIONS[it_name]
+        pattern = re.compile(re.escape(it_name) + r'\s*\(', re.IGNORECASE)
+        result = pattern.sub(en_name + '(', result)
+
+    # Sostituisci ; con , ma solo fuori dalle stringhe
+    translated = []
+    in_string = False
+    for ch in result:
+        if in_string:
+            translated.append(ch)
+            if ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+                translated.append(ch)
+            elif ch == ';':
+                translated.append(',')
+            else:
+                translated.append(ch)
+
+    return ''.join(translated)
+
+
+def convert_formulas_value(val):
+    """Converte i tipi della libreria formulas in tipi Python nativi serializzabili JSON."""
+    if val is None:
+        return ''
+
+    # Ranges object della libreria formulas -> prendi il primo valore
+    if hasattr(val, 'value'):
+        val = val.value
+
+    # numpy array
+    if isinstance(val, np.ndarray):
+        val = val.item() if val.size == 1 else val.tolist()
+
+    # Tipi numpy scalari
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        f = float(val)
+        return int(f) if f == int(f) else f
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if isinstance(val, (np.str_,)):
+        return str(val)
+
+    # Booleani Python nativi (prima di int, perche' bool e' subclass di int)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float, str)):
+        return val
+
+    # Fallback
+    return str(val)
 
 
 # ---------------------------------------------------------------------------
-# Batch manager
-# ---------------------------------------------------------------------------
-class BatchManager:
-    """Accumula le request in arrivo e le risolve quando la finestra scade."""
-
-    def __init__(self, window_s=BATCH_WINDOW_S):
-        self.window_s = window_s
-        self._lock = threading.Lock()
-        self._batch: dict[str, dict] = {}      # cell -> entry
-        self._timer: threading.Timer | None = None
-        # Cache: cell -> (timestamp, result_dict)
-        self._cache: dict[str, tuple[float, dict]] = {}
-
-    # -- public API (chiamato dal thread Flask per ogni request) ------------
-
-    def submit(self, cell: str, operation: str, args: list[dict]) -> dict:
-        """Aggiunge una cella al batch corrente e blocca fino alla risoluzione.
-
-        Ritorna il dict {'result': ...} oppure {'error': ...}.
-        """
-        cell = normalize_cell(cell)
-
-        # Cache hit: se questa cella e' stata calcolata di recente,
-        # rispondi subito senza aspettare il batch.
-        # Questo evita le cascate di ricalcolo di Sheets.
-        with self._lock:
-            if cell in self._cache:
-                ts, cached_result = self._cache[cell]
-                if time.time() - ts < CACHE_TTL_S:
-                    print(f"[CACHE]  {cell} -> {cached_result.get('result', '?')} (age: {time.time()-ts:.1f}s)")
-                    return cached_result
-
-        event = threading.Event()
-        entry = {
-            'cell': cell,
-            'operation': operation,
-            'args': args,           # [{ref: "A1", value: 10}, ...]
-            'event': event,
-            'result': None,
-        }
-
-        with self._lock:
-            self._batch[cell] = entry
-            self._reset_timer()
-
-        # Blocca fino a risoluzione (timeout di sicurezza)
-        event.wait(timeout=30)
-
-        if entry['result'] is None:
-            return {'error': 'Timeout: batch non risolto entro 30s'}
-        return entry['result']
-
-    # -- internals ----------------------------------------------------------
-
-    def _reset_timer(self):
-        """Resetta (o avvia) il timer della finestra di batch."""
-        if self._timer is not None:
-            self._timer.cancel()
-        self._timer = threading.Timer(self.window_s, self._resolve_batch)
-        self._timer.daemon = True
-        self._timer.start()
-
-    def _resolve_batch(self):
-        """Scaduta la finestra: risolvi tutto il batch."""
-        with self._lock:
-            batch = self._batch
-            self._batch = {}
-            self._timer = None
-
-        if not batch:
-            return
-
-        cells_in_batch = set(batch.keys())
-        print(f"\n[BATCH] Risoluzione di {len(batch)} celle: {sorted(cells_in_batch)}")
-
-        # 1. Costruisci il grafo di dipendenze (solo fra celle nel batch)
-        #    deps[cell] = set di celle nel batch da cui dipende
-        deps: dict[str, set[str]] = {}
-        for cell, entry in batch.items():
-            cell_deps = set()
-            for arg in entry['args']:
-                ref = normalize_cell(arg.get('ref', ''))
-                if ref in cells_in_batch and ref != cell:
-                    cell_deps.add(ref)
-            deps[cell] = cell_deps
-
-        # 2. Topological sort (Kahn's algorithm)
-        order = self._topological_sort(deps)
-        if order is None:
-            # Ciclo nelle dipendenze
-            for entry in batch.values():
-                entry['result'] = {'error': 'Dipendenza circolare rilevata nel batch'}
-                entry['event'].set()
-            return
-
-        print(f"[BATCH] Ordine di esecuzione: {order}")
-
-        # 3. Esegui in ordine, propagando i risultati
-        computed: dict[str, any] = {}   # cell -> valore calcolato
-
-        for cell in order:
-            entry = batch[cell]
-            op = entry['operation'].lower()
-
-            # Sostituisci i valori degli argomenti che dipendono da celle
-            # gia' calcolate in questo batch
-            resolved_args = []
-            for arg in entry['args']:
-                ref = normalize_cell(arg.get('ref', ''))
-                if ref in computed:
-                    # Usa il valore appena calcolato
-                    resolved_args.append(parse_value(computed[ref]))
-                else:
-                    resolved_args.append(parse_value(arg.get('value')))
-
-            # Calcola
-            try:
-                if op not in OPERATIONS:
-                    entry['result'] = {'error': f'Operazione sconosciuta: {op}'}
-                else:
-                    result = OPERATIONS[op](*resolved_args)
-                    computed[cell] = result
-                    result_dict = {'result': result, 'cell': cell}
-                    entry['result'] = result_dict
-                    # Salva in cache
-                    with self._lock:
-                        self._cache[cell] = (time.time(), result_dict)
-                    print(f"[BATCH]   {cell} = {result}")
-            except Exception as e:
-                entry['result'] = {'error': f'Errore calcolo {cell}: {str(e)}'}
-
-            entry['event'].set()
-
-        # Sblocca eventuali celle non nell'ordine (non dovrebbe succedere)
-        for entry in batch.values():
-            if not entry['event'].is_set():
-                entry['result'] = {'error': 'Cella non risolta'}
-                entry['event'].set()
-
-    @staticmethod
-    def _topological_sort(deps: dict[str, set[str]]) -> list[str] | None:
-        """Kahn's algorithm. Ritorna l'ordine o None se c'e' un ciclo."""
-        in_degree = {n: 0 for n in deps}
-        for node, node_deps in deps.items():
-            for d in node_deps:
-                if d not in in_degree:
-                    in_degree[d] = 0
-
-        # Calcola in-degree (quante celle dipendono da me -> irrilevante,
-        # ci serve quante dipendenze ha ogni cella)
-        # in_degree[cell] = numero di dipendenze non ancora risolte
-        adj: dict[str, list[str]] = {n: [] for n in in_degree}
-        for node, node_deps in deps.items():
-            in_degree[node] = len(node_deps)
-            for d in node_deps:
-                adj.setdefault(d, []).append(node)
-
-        queue = [n for n, deg in in_degree.items() if deg == 0]
-        order = []
-        while queue:
-            node = queue.pop(0)
-            order.append(node)
-            for neighbor in adj.get(node, []):
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
-
-        if len(order) != len(in_degree):
-            return None  # ciclo
-        return order
-
-
-# Singleton
-batch_manager = BatchManager()
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
+# Request timing
 # ---------------------------------------------------------------------------
 
 @app.before_request
@@ -289,53 +226,162 @@ def _log_request_time(response):
     return response
 
 
-@app.route('/batch_calc', methods=['POST'])
-def batch_calc():
-    """Endpoint per le chiamate batch con dipendenze.
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/eval_sheet', methods=['POST'])
+def eval_sheet():
+    """Valuta un intero foglio: riceve formule + valori, restituisce risultati.
 
     Payload atteso:
     {
-        "cell": "C3",
-        "operation": "sum",
-        "args": [
-            {"ref": "A1", "value": 10},
-            {"ref": "A2", "value": 20}
-        ]
+        "formulas": [["=SUM(A1:A2)", "", ...], ...],
+        "values":   [[null, 42, "hello", ...], ...]
+    }
+
+    - formulas[r][c]: stringa formula (es "=SUM(A1:A2)") o "" se non e' formula
+    - values[r][c]:   valore letterale della cella (usato dove formulas e' "")
+
+    Risposta:
+    {
+        "results": [[...], ...],
+        "stats": {"total_cells": N, "formula_cells": N, "eval_time_ms": N}
     }
     """
+    tmp_path = None
     try:
+        start = time.time()
         data = request.get_json()
-        cell = data.get('cell', '')
-        operation = data.get('operation', '')
-        args = data.get('args', [])
 
-        if not cell:
-            return jsonify({'error': 'cell is required'}), 400
-        if not operation:
-            return jsonify({'error': 'operation is required'}), 400
+        formulas_grid = data.get('formulas', [])
+        values_grid = data.get('values', [])
 
-        result = batch_manager.submit(cell, operation, args)
-        status = 200 if 'result' in result else 500
-        return jsonify(result), status
+        if not values_grid:
+            return jsonify({'error': 'values grid is required'}), 400
+
+        num_rows = len(values_grid)
+        num_cols = max(len(row) for row in values_grid) if values_grid else 0
+
+        if num_rows == 0 or num_cols == 0:
+            return jsonify({'error': 'Empty sheet'}), 400
+
+        # ----- Costruisci workbook temporaneo con openpyxl -----
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Model'
+
+        formula_count = 0
+
+        for r in range(num_rows):
+            for c in range(num_cols):
+                cell = ws.cell(row=r + 1, column=c + 1)
+
+                # Controlla se c'e' una formula
+                formula = ''
+                if r < len(formulas_grid) and c < len(formulas_grid[r]):
+                    formula = formulas_grid[r][c]
+
+                if formula:
+                    cell.value = translate_formula_it_to_en(formula)
+                    formula_count += 1
+                else:
+                    val = values_grid[r][c] if c < len(values_grid[r]) else None
+                    cell.value = parse_value(val)
+
+        # ----- Salva su file temporaneo e calcola -----
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.xlsx')
+        os.close(tmp_fd)
+        wb.save(tmp_path)
+
+        xl_model = formulas_lib.ExcelModel().loads(tmp_path).finish()
+        solution = xl_model.calculate()
+
+        # ----- Costruisci lookup normalizzato dalla solution -----
+        # La libreria formulas usa chiavi tipo "'[book.xlsx]Sheet'!A1"
+        cell_pattern = re.compile(r"!([A-Z]+\d+)$", re.IGNORECASE)
+        sheet_pattern = re.compile(r"\](.+?)'!", re.IGNORECASE)
+
+        solution_map = {}
+        for key, val in solution.items():
+            cell_match = cell_pattern.search(str(key))
+            sheet_match = sheet_pattern.search(str(key))
+            if cell_match:
+                cell_name = cell_match.group(1).upper()
+                sheet_name = sheet_match.group(1).upper() if sheet_match else 'MODEL'
+                normalized_key = f"{sheet_name}!{cell_name}"
+                solution_map[normalized_key] = val
+
+        # ----- Leggi risultati -----
+        results = []
+        for r in range(num_rows):
+            row = []
+            for c in range(num_cols):
+                col_letter = openpyxl.utils.get_column_letter(c + 1)
+                lookup_key = f"MODEL!{col_letter}{r + 1}"
+
+                if lookup_key in solution_map:
+                    val = solution_map[lookup_key]
+                    val = convert_formulas_value(val)
+                    row.append(val)
+                else:
+                    val = values_grid[r][c] if c < len(values_grid[r]) else None
+                    row.append(parse_value(val) if val is not None else '')
+            results.append(row)
+
+        elapsed_ms = int((time.time() - start) * 1000)
+
+        # Debug opzionale
+        debug_info = {}
+        if data.get('debug'):
+            debug_info = {
+                'raw_solution_keys': [str(k) for k in list(solution.keys())[:50]],
+                'normalized_keys': list(solution_map.keys())[:50],
+            }
+
+        response_data = {
+            'results': results,
+            'stats': {
+                'total_cells': num_rows * num_cols,
+                'formula_cells': formula_count,
+                'eval_time_ms': elapsed_ms
+            }
+        }
+        if debug_info:
+            response_data['debug'] = debug_info
+
+        return jsonify(response_data)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'mode': 'batch'})
+    return jsonify({'status': 'healthy', 'mode': 'batch_sheet'})
 
 
 @app.route('/operations', methods=['GET'])
 def list_operations():
-    return jsonify({'operations': sorted(OPERATIONS.keys())})
+    """Lista delle funzioni Excel supportate dalla libreria formulas."""
+    return jsonify({
+        'operations': sorted(IT_TO_EN_FUNCTIONS.keys()),
+        'note': 'La libreria formulas supporta la maggior parte delle funzioni Excel standard. '
+                'Le formule italiane vengono tradotte automaticamente in inglese.'
+    })
 
 
 if __name__ == '__main__':
-    print(f"Batch Cloud Calc API - finestra batch: {BATCH_WINDOW_S}s")
+    print("Cloud Calc Batch API - Valutazione fogli interi")
     print("Endpoints:")
-    print("  POST /batch_calc  - calcolo con dipendenze (batch)")
+    print("  POST /eval_sheet  - valuta un intero foglio")
     print("  GET  /health")
     print("  GET  /operations")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
